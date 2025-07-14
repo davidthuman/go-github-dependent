@@ -1,11 +1,16 @@
 package main
 
-import "testing"
+import (
+	"testing"
+)
 
 func benchmarkGetDependents(i int, b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		GetDependents("inconshreveable", "mousetrap", QueryDependentsConfig{MaxPages: i})
 	}
+
+	b.ReportMetric(float64(b.Elapsed().Milliseconds())/float64(i)/float64(b.N), "ms/page")
+
 }
 
 func BenchmarkGetDependents1(b *testing.B)  { benchmarkGetDependents(1, b) }
