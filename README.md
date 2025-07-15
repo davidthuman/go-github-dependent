@@ -25,3 +25,16 @@ BenchmarkGetDependents40-10            1        9312551875 ns/op               2
 PASS
 ok      github.com/davidthuman/go-github-dependent      19.303s
 ```
+
+```
+$ go test -run=XXX -bench=^BenchmarkGetDependentsProducerConsumer  
+goos: darwin
+goarch: arm64
+pkg: github.com/davidthuman/go-github-dependent
+cpu: Apple M2 Pro
+BenchmarkGetDependentsProducerConsumer1-10             2         532909417 ns/op               532.5 ms/page
+BenchmarkGetDependentsProducerConsumer2-10             5         230293042 ns/op               115.1 ms/page
+BenchmarkGetDependentsProducerConsumer3-10             3         345448347 ns/op               115.1 ms/page
+BenchmarkGetDependentsProducerConsumer10-10            1        2840526000 ns/op               284.0 ms/page
+BenchmarkGetDependentsProducerConsumer20-10            1        4386396500 ns/op               219.3 ms/page
+```

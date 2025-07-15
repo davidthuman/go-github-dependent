@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -25,6 +27,11 @@ type QueryDependentsConfig struct {
 	MaxPages int
 }
 
+type HtmlPage struct {
+	Page *html.Node
+	Url  string
+}
+
 func containsKeyValue(elems []html.Attribute, key, value string) bool {
 	for _, s := range elems {
 		if key == s.Key && value == s.Val {
@@ -34,9 +41,11 @@ func containsKeyValue(elems []html.Attribute, key, value string) bool {
 	return false
 }
 
-func parseDependentPage(doc *html.Node, urlFrom string) ([]DependentRepository, string, error) {
+func parseDependentsPage(page HtmlPage) ([]DependentRepository, error) {
 
-	urlParsed, _ := url.Parse(urlFrom)
+	slog.Debug("Parsing pages for dependent repos", "url", page.Url)
+
+	urlParsed, _ := url.Parse(page.Url)
 	params, _ := url.ParseQuery(urlParsed.RawQuery)
 
 	after_list := params["dependents_after"]
@@ -56,8 +65,6 @@ func parseDependentPage(doc *html.Node, urlFrom string) ([]DependentRepository, 
 	}
 
 	dependents := make([]DependentRepository, 0)
-
-	nextPageURL := ""
 
 	var crawler func(*html.Node)
 	crawler = func(node *html.Node) {
@@ -88,6 +95,47 @@ func parseDependentPage(doc *html.Node, urlFrom string) ([]DependentRepository, 
 			dependents = append(dependents, dependentRepo)
 			return
 		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			crawler(child)
+		}
+	}
+	crawler(page.Page)
+
+	return dependents, nil
+}
+
+func pageToDependents(pageCh <-chan HtmlPage, dependentsCh chan<- []DependentRepository, closeCh <-chan bool) {
+	for {
+		page, ok := <-pageCh
+		if ok {
+			dependents, err := parseDependentsPage(page)
+			if err != nil {
+				slog.Error("Error when parsing dependents page", "error", err)
+				return
+			}
+			dependentsCh <- dependents
+		} else {
+			slog.Debug("Page Channel closed, closing Dependents Channel")
+			// close(dependentsCh)
+			return
+		}
+
+		//case <-closeCh:
+		//	slog.Debug("Received close witin pageToDependents")
+		//	return
+
+	}
+
+}
+
+func parseDependentsPageForNextUrl(doc *html.Node) (string, error) {
+
+	slog.Debug("Parsing page for next URL")
+
+	nextPageURL := ""
+
+	var crawler func(*html.Node)
+	crawler = func(node *html.Node) {
 		if node.Type == html.ElementNode && node.Data == "div" && containsKeyValue(node.Attr, "class", "paginate-container") {
 			for _, attr := range node.FirstChild.NextSibling.FirstChild.NextSibling.Attr {
 				if attr.Key == "href" {
@@ -103,22 +151,58 @@ func parseDependentPage(doc *html.Node, urlFrom string) ([]DependentRepository, 
 
 	slog.Debug("Next Page URL", "next_page_url", nextPageURL)
 
-	return dependents, nextPageURL, nil
+	return nextPageURL, nil
+
+}
+
+func parsePageToNextUrl(pageCh <-chan *html.Node, nextUrlCh chan<- string, closeCh chan<- bool, maxPages int) {
+
+	pageCount := 0
+
+	for {
+		if pageCount >= maxPages {
+			break
+		}
+		doc := <-pageCh
+		nextUrl, err := parseDependentsPageForNextUrl(doc)
+		if err != nil {
+			slog.Debug("Error when paring page for next url", "error", err)
+			return
+		}
+		pageCount += 1
+		slog.Debug("Current page count", "count", pageCount)
+		nextUrlCh <- nextUrl
+
+	}
+
+	slog.Debug("Closing channels")
+	close(nextUrlCh)
+	//closeCh <- true
 
 }
 
 func getDependentsPage(url string) (*html.Node, error) {
 
+	slog.Debug("Requesting GitHub dependent page", "url", url)
+
 	response, err := http.Get(url)
 
 	if err != nil {
-		slog.Error("Error when making request to GitHub", "error", err)
+		slog.Error("Error when making request to GitHub", "error", err, "url", url)
 		return nil, err
 	}
 
 	defer response.Body.Close()
 
 	slog.Debug("Response", "status_code", response.StatusCode)
+
+	if response.StatusCode != 200 {
+		slog.Error("Response status code is not 200", "status_code", response.StatusCode, "status", response.Status)
+		log.Println(response.Header)
+		body, _ := io.ReadAll(response.Body)
+		log.Println(string(body))
+		return nil, errors.New("response status code is not 200")
+	}
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -134,6 +218,31 @@ func getDependentsPage(url string) (*html.Node, error) {
 	}
 
 	return doc, nil
+}
+
+func urlToPage(urlCh <-chan string, pageCh chan<- HtmlPage, closeCh <-chan bool) {
+
+	for {
+		nextUrl, ok := <-urlCh
+		if ok {
+			slog.Debug("Received URL in urlToPage", "url", nextUrl)
+			doc, err := getDependentsPage(nextUrl)
+			if err != nil {
+				slog.Error("Error when getting dependents page", "error", err, "url", nextUrl)
+				return
+			}
+			pageCh <- HtmlPage{Page: doc, Url: nextUrl}
+		} else {
+			slog.Debug("URL Channel closed, closing page channel")
+			close(pageCh)
+			return
+		}
+		//case <-closeCh:
+		//	slog.Debug("Received close within urlToPage")
+		//	return
+
+	}
+
 }
 
 func GetDependents(repoOwner, repoName string, config QueryDependentsConfig) ([]DependentRepository, error) {
@@ -183,14 +292,14 @@ func GetDependents(repoOwner, repoName string, config QueryDependentsConfig) ([]
 			return nil, err
 		}
 
-		dependents, newNextPageURL, err := parseDependentPage(doc, nextPageURL)
+		dependents, err := parseDependentsPage(HtmlPage{Page: doc, Url: nextPageURL})
 
 		if err != nil {
 			slog.Error("Error when parsing dependents page", "error", err)
 			return nil, err
 		}
 
-		nextPageURL = newNextPageURL
+		nextPageURL, _ = parseDependentsPageForNextUrl(doc)
 
 		allDependents = append(allDependents, dependents...)
 
@@ -204,10 +313,63 @@ func GetDependents(repoOwner, repoName string, config QueryDependentsConfig) ([]
 
 }
 
+func GetDependentsProducerConsumer(repoOwner, repoName string, config QueryDependentsConfig) ([]DependentRepository, error) {
+
+	// URL to Page
+	// Page to Next URL
+
+	// Page to list of Dependents
+
+	urlCh := make(chan string, config.MaxPages)
+	pageCh := make(chan HtmlPage, config.MaxPages)
+	pageForUrlCh := make(chan *html.Node, config.MaxPages)
+	pageForDependentsCh := make(chan HtmlPage, config.MaxPages)
+	dependentsCh := make(chan []DependentRepository, config.MaxPages)
+	closeCh := make(chan bool)
+
+	//var wg sync.WaitGroup
+
+	urlCh <- fmt.Sprintf("https://github.com/%s/%s/network/dependents", repoOwner, repoName)
+
+	go urlToPage(urlCh, pageCh, closeCh)
+
+	go parsePageToNextUrl(pageForUrlCh, urlCh, closeCh, config.MaxPages)
+
+	go pageToDependents(pageForDependentsCh, dependentsCh, closeCh)
+
+	dependents := make([]DependentRepository, 0)
+
+out:
+	for {
+		select {
+		case htmlPage, ok := <-pageCh:
+			if ok {
+				pageForUrlCh <- htmlPage.Page
+				pageForDependentsCh <- htmlPage
+			} else {
+				slog.Debug("Page Channel closed")
+				close(pageForUrlCh)
+				close(pageForDependentsCh)
+				break out
+			}
+		case newDependents := <-dependentsCh:
+			slog.Debug("Received dependents list", "length", len(newDependents))
+			dependents = append(dependents, newDependents...)
+			//case <-closeCh:
+			//	break out
+		}
+	}
+
+	slog.Debug("OUT of for loop")
+
+	return dependents, nil
+
+}
+
 func main() {
 	//getRepo()
 
-	slog.SetLogLoggerLevel(slog.LevelInfo)
+	slog.SetLogLoggerLevel(slog.LevelDebug)
 
-	GetDependents("inconshreveable", "mousetrap", QueryDependentsConfig{MaxPages: 5})
+	GetDependentsProducerConsumer("inconshreveable", "mousetrap", QueryDependentsConfig{MaxPages: 5})
 }
